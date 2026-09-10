@@ -1,5 +1,10 @@
 const DEFAULT_DEVICE_REFRESH_INTERVAL_MS = 15000;
-const ACTIVE_VOLUME_REFRESH_DEFER_MS = 350;
+// Kept in step with the 1s guard the on-screen slider uses
+// (live_values.updateBindingValues / slider.dataset.lastMidiUpdate). A fader
+// move - hardware or UI - must fully suppress non-urgent session polling until
+// the Core Audio volume write and its readback have settled, otherwise a poll
+// landing mid-move pushes a stale value back to a motorised fader (snap-back).
+const ACTIVE_VOLUME_REFRESH_DEFER_MS = 1000;
 
 function normalizedNumber(value) {
   const next = Number(value);

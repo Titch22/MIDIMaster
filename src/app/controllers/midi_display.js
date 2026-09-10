@@ -161,6 +161,18 @@ export function createMidiDisplay({
       return;
     }
 
+    // A hardware fader move is active volume input, exactly like dragging the
+    // on-screen slider. Mark it on the same clocks the periodic session refresh
+    // (session_refresh.volumeInputIsActive) and the integration echo suppression
+    // (flushVolumeUpdatePayloads.shouldSuppressIntegrationEcho) already watch, so
+    // a poll or a stale backend echo landing mid-move cannot push an outdated
+    // readback value back to a motorised fader.
+    const now = Date.now();
+    liveState.lastVolumeUpdateAt = now;
+    if (binding.id != null) {
+      liveState.bindingInteractionTimes[binding.id] = now;
+    }
+
     const directSlider = findBindingSlider(binding.id);
     if (directSlider) {
       setBindingSliderVolume(directSlider, volume, {

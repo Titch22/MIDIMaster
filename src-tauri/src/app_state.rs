@@ -31,6 +31,14 @@ use windows::Win32::System::Threading::{
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+/// After a fader/knob is driven locally (hardware MIDI or the on-screen slider),
+/// the periodic feedback sync keeps echoing the value the immediate handler
+/// already sent for this long, instead of the freshly polled audio readback.
+/// Core Audio applies volume changes with a small, variable delay, so a poll
+/// landing inside this window would otherwise push a stale position back to a
+/// motorised fader - a brief "snap-back" before it settles again.
+pub(crate) const LOCAL_INPUT_FEEDBACK_GRACE: Duration = Duration::from_millis(2000);
+
 #[cfg(target_os = "windows")]
 pub(crate) fn focused_application_name() -> Option<String> {
     let hwnd = unsafe { GetForegroundWindow() };
@@ -463,6 +471,16 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// True when this control received a local MIDI/UI input within `window`.
+    /// Used to hold off periodic feedback while the audio backend catches up.
+    pub(crate) fn binding_locally_driven_within(&self, key: &BindingKey, window: Duration) -> bool {
+        self.binding_state
+            .lock()
+            .ok()
+            .and_then(|states| states.get(key).map(|state| state.last_update.elapsed() < window))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn set_binding_action_value(&self, key: &BindingKey, value: f32) {
         if let Ok(mut values) = self.binding_action_values.lock() {
             values.insert(key.clone(), value.clamp(0.0, 1.0));
@@ -764,6 +782,19 @@ impl AppState {
                             }
                         } else {
                             mute_transition_until.remove(&key);
+                        }
+                    }
+
+                    // A fader just moved by hand is already at the right place
+                    // (the immediate handler echoed the requested position). Keep
+                    // that value until the audio backend readback catches up, so
+                    // a poll mid-ramp cannot briefly drag a motorised fader back.
+                    if binding.action == model::BindingAction::Volume
+                        && binding.mode != model::MidiMode::Relative
+                        && self.binding_locally_driven_within(&key, LOCAL_INPUT_FEEDBACK_GRACE)
+                    {
+                        if let Some(previous_val) = feedback.get(&key).cloned() {
+                            val = previous_val;
                         }
                     }
                 } else {
