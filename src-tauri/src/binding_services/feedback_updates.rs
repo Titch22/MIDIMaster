@@ -1,5 +1,15 @@
 use super::*;
 
+/// `update_midi_feedback` is also called by the periodic UI reconciliation, which
+/// sources its value from the frontend's own session/device caches. Device
+/// volumes refresh there only every ~15s, so seconds after a fader is released a
+/// poll can call in with the pre-move volume. If that value contradicts what the
+/// audio backend currently reads for the control by more than this, treat it as a
+/// stale-cache echo and drop it, so a motorised fader is not shoved back to an
+/// old position. Genuine external changes still arrive via the backend
+/// feedback-sync loop (which reads live audio every 250-750ms).
+const STALE_UI_VOLUME_FEEDBACK_TOLERANCE: f32 = 0.05;
+
 pub fn update_midi_feedback(
     state: &AppState,
     target: model::BindingTarget,
@@ -49,6 +59,22 @@ pub fn update_midi_feedback(
                 &format!("binding_id={} is_note={}", binding.id, is_note),
             );
             continue;
+        }
+
+        if matches!(binding.action, model::BindingAction::Volume) && !binding.is_button_binding() {
+            if let Some(known) = state.binding_action_value(&key) {
+                if (known - value).abs() > STALE_UI_VOLUME_FEEDBACK_TOLERANCE {
+                    run_logger::debug(
+                        "bindings_cmd",
+                        "feedback_skipped_stale_ui",
+                        &format!(
+                            "binding_id={} ui_value={} known={}",
+                            binding.id, value, known
+                        ),
+                    );
+                    continue;
+                }
+            }
         }
 
         if binding.is_button_binding() {
