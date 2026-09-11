@@ -177,6 +177,13 @@ fn migrate_profile_route_inputs(
     migrated_count +=
         migrate_control_device_ids_atomically(profile, &route_input_migrations, &mut migrations);
 
+    migrated_count += migrate_orphaned_control_ids_to_bindings_own_route(
+        profile,
+        routes,
+        &saved_routes,
+        &mut migrations,
+    );
+
     migrated_count += migrate_orphaned_binding_device_ids_to_primary_route(
         profile,
         &saved_routes,
@@ -292,6 +299,110 @@ fn migrate_control_device_id(
     migrated_count
 }
 
+/// Repairs a binding whose fields disagree about which active route they
+/// belong to, without guessing across bindings or across still-configured
+/// devices. If at least one of a binding's own device-id fields (primary,
+/// mute/assign/indicator control) still matches a currently active input
+/// route, that value is trusted as the binding's anchor. Any *other* field on
+/// the same binding is repaired to match it only when that field's value is
+/// not recognized as *any* known device - neither a currently active route
+/// nor a still-saved (just not currently connected) one - since a value that
+/// matches a known-but-inactive device is real information (e.g. a second
+/// device that simply isn't part of this particular reconnect) and must not
+/// be overwritten. A binding with no field matching any active route is left
+/// untouched, since there is nothing on it to safely anchor a guess to - it
+/// falls through to the broader (and stricter) single-orphan fallback below.
+fn migrate_orphaned_control_ids_to_bindings_own_route(
+    profile: &mut Profile,
+    routes: &[MidiDeviceRoute],
+    saved_routes: &[MidiDeviceRoute],
+    migrations: &mut Vec<BindingDeviceMigration>,
+) -> usize {
+    let active_input_ids = routes
+        .iter()
+        .filter_map(|route| route.normalized())
+        .filter_map(|route| route.input_id().map(str::to_string))
+        .collect::<HashSet<_>>();
+    if active_input_ids.is_empty() {
+        return 0;
+    }
+
+    let mut known_ids = active_input_ids.clone();
+    known_ids.extend(
+        routes
+            .iter()
+            .filter_map(|route| route.normalized())
+            .filter_map(|route| route.output_id().map(str::to_string)),
+    );
+    known_ids.extend(
+        saved_routes
+            .iter()
+            .filter_map(|route| route.input_id().map(str::to_string)),
+    );
+    known_ids.extend(
+        saved_routes
+            .iter()
+            .filter_map(|route| route.output_id().map(str::to_string)),
+    );
+
+    let mut migrated_count = 0usize;
+
+    for binding in &mut profile.bindings {
+        let anchor = [
+            Some(binding.device_id.as_str()),
+            binding
+                .mute_control
+                .as_ref()
+                .map(|control| control.device_id.as_str()),
+            binding
+                .assign_control
+                .as_ref()
+                .map(|control| control.device_id.as_str()),
+            binding
+                .indicator_control
+                .as_ref()
+                .map(|control| control.device_id.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|device_id| active_input_ids.contains(*device_id))
+        .map(str::to_string);
+        let Some(anchor) = anchor else {
+            continue;
+        };
+
+        let mut binding_migrations = Vec::new();
+        let mut repair = |device_id: &mut String| {
+            if device_id.starts_with("midi:")
+                && *device_id != anchor
+                && !known_ids.contains(device_id.as_str())
+            {
+                let previous = std::mem::replace(device_id, anchor.clone());
+                binding_migrations.push((previous, anchor.clone()));
+            }
+        };
+
+        repair(&mut binding.device_id);
+        if let Some(mute_control) = binding.mute_control.as_mut() {
+            repair(&mut mute_control.device_id);
+        }
+        if let Some(assign_control) = binding.assign_control.as_mut() {
+            repair(&mut assign_control.device_id);
+        }
+        if let Some(indicator_control) = binding.indicator_control.as_mut() {
+            repair(&mut indicator_control.device_id);
+        }
+        drop(repair);
+
+        migrated_count += binding_migrations.len();
+        for (previous_device_id, device_id) in binding_migrations {
+            record_binding_migration(migrations, &binding.id, &previous_device_id, &device_id);
+        }
+    }
+
+    migrated_count
+}
+
 fn migrate_orphaned_binding_device_ids_to_primary_route(
     profile: &mut Profile,
     saved_routes: &[MidiDeviceRoute],
@@ -371,6 +482,18 @@ fn migrate_orphaned_binding_device_ids_to_primary_route(
         .collect::<HashSet<_>>();
 
     if orphan_device_ids.len() != 1 {
+        if !orphan_device_ids.is_empty() {
+            run_logger::warn(
+                "midi_cmd",
+                "orphan_binding_device_ids_ambiguous",
+                &format!(
+                    "orphan_count={} orphan_device_ids={:?} active_route_count={}",
+                    orphan_device_ids.len(),
+                    orphan_device_ids,
+                    normalized_routes.len()
+                ),
+            );
+        }
         return 0;
     }
 
@@ -391,6 +514,18 @@ fn migrate_single_stale_device_id_to_primary_route(
     migrations: &mut Vec<BindingDeviceMigration>,
 ) -> usize {
     if stale_device_ids.len() != 1 {
+        if !stale_device_ids.is_empty() {
+            run_logger::warn(
+                "midi_cmd",
+                "orphan_binding_device_ids_ambiguous",
+                &format!(
+                    "orphan_count={} orphan_device_ids={:?} active_route_count={}",
+                    stale_device_ids.len(),
+                    stale_device_ids,
+                    active_route_count
+                ),
+            );
+        }
         return 0;
     }
     let Some(orphan_device_id) = stale_device_ids.iter().next() else {
@@ -1164,6 +1299,120 @@ mod tests {
                 previous_device_id: "midi:0".to_string(),
                 device_id: "midi:1".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn migrate_route_inputs_repairs_aux_control_when_only_mute_device_id_drifted() {
+        let mut profile = profile_with(binding("midi:1", Some("midi:9"), None));
+        profile.midi_device_preference.routes = vec![route("midi:1", "midi:2", "Platform X+")];
+        let active_routes = profile.midi_device_preference.routes.clone();
+
+        let (migrated_count, migrations) =
+            migrate_profile_route_inputs(&mut profile, &active_routes);
+
+        assert_eq!(migrated_count, 1);
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(profile.bindings[0].device_id, "midi:1");
+        assert_eq!(
+            profile.bindings[0]
+                .mute_control
+                .as_ref()
+                .expect("mute control")
+                .device_id,
+            "midi:1"
+        );
+        assert_eq!(
+            migrations[0],
+            BindingDeviceMigration {
+                binding_id: "binding-1".to_string(),
+                previous_device_id: "midi:9".to_string(),
+                device_id: "midi:1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn migrate_route_inputs_repairs_binding_device_id_when_aux_control_still_valid() {
+        let mut profile = profile_with(binding("midi:9", None, Some("midi:1")));
+        profile.midi_device_preference.routes = vec![route("midi:1", "midi:2", "Platform X+")];
+        let active_routes = profile.midi_device_preference.routes.clone();
+
+        let (migrated_count, migrations) =
+            migrate_profile_route_inputs(&mut profile, &active_routes);
+
+        assert_eq!(migrated_count, 1);
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(profile.bindings[0].device_id, "midi:1");
+        assert_eq!(
+            profile.bindings[0]
+                .assign_control
+                .as_ref()
+                .expect("assign control")
+                .device_id,
+            "midi:1"
+        );
+    }
+
+    #[test]
+    fn migrate_route_inputs_two_bindings_each_with_independent_orphaned_aux_control() {
+        let mut binding_a = binding("midi:1", Some("midi:8"), None);
+        binding_a.id = "binding-a".to_string();
+        let mut binding_b = binding("midi:3", None, Some("midi:9"));
+        binding_b.id = "binding-b".to_string();
+
+        let mut profile = profile_with(binding_a);
+        profile.bindings.push(binding_b);
+        profile.midi_device_preference.routes = vec![
+            route("midi:1", "midi:2", "Platform X+"),
+            route("midi:3", "midi:4", "MIDI Mix"),
+        ];
+        let active_routes = profile.midi_device_preference.routes.clone();
+
+        let (migrated_count, migrations) =
+            migrate_profile_route_inputs(&mut profile, &active_routes);
+
+        assert_eq!(migrated_count, 2);
+        assert_eq!(migrations.len(), 2);
+        assert_eq!(profile.bindings[0].device_id, "midi:1");
+        assert_eq!(
+            profile.bindings[0]
+                .mute_control
+                .as_ref()
+                .expect("mute control")
+                .device_id,
+            "midi:1"
+        );
+        assert_eq!(profile.bindings[1].device_id, "midi:3");
+        assert_eq!(
+            profile.bindings[1]
+                .assign_control
+                .as_ref()
+                .expect("assign control")
+                .device_id,
+            "midi:3"
+        );
+    }
+
+    #[test]
+    fn migrate_route_inputs_leaves_binding_untouched_when_all_fields_orphaned() {
+        let mut profile = profile_with(binding("midi:8", Some("midi:9"), None));
+        profile.midi_device_preference.routes = vec![route("midi:1", "midi:2", "Platform X+")];
+        let active_routes = profile.midi_device_preference.routes.clone();
+
+        let (migrated_count, migrations) =
+            migrate_profile_route_inputs(&mut profile, &active_routes);
+
+        assert_eq!(migrated_count, 0);
+        assert!(migrations.is_empty());
+        assert_eq!(profile.bindings[0].device_id, "midi:8");
+        assert_eq!(
+            profile.bindings[0]
+                .mute_control
+                .as_ref()
+                .expect("mute control")
+                .device_id,
+            "midi:9"
         );
     }
 
